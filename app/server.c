@@ -7,6 +7,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define BUF_SIZE 1024
+char *response_ok = "HTTP/1.1 200 OK\r\n\r\n";
+char *response_not_found = "HTTP/1.1 404 Not Found\r\n\r\n";
+
 int main() {
   // Disable output buffering
   setbuf(stdout, NULL);
@@ -54,10 +58,31 @@ int main() {
   printf("Waiting for a client to connect...\n");
   client_addr_len = sizeof(client_addr);
 
-  int fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+  int client_fd =
+      accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+
+  if (client_fd < 0) {
+    printf("Accept failed: %s\n", strerror(errno));
+    return 1;
+  }
+
   printf("Client connected\n");
-  char *reply = "HTTP/1.1 200 OK\r\n\r\n";
-  int bytes_sent = send(fd, reply, strlen(reply), 0);
+
+  char request_buffer[BUF_SIZE];
+
+  if (read(client_fd, request_buffer, BUF_SIZE) < 0) {
+    printf("Read failed: %s\n", strerror(errno));
+    return 1;
+  } else {
+    printf("Request from client: %s\n", request_buffer);
+  }
+
+  char *path = strtok(request_buffer, " ");
+  path = strtok(NULL, " ");
+
+  char *reply = strcmp(path, "/") == 0 ? response_ok : response_not_found;
+
+  int bytes_sent = send(client_fd, reply, strlen(reply), 0);
 
   close(server_fd);
 
