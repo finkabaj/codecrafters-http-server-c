@@ -10,6 +10,12 @@
 #define BUF_SIZE 1024
 char *response_ok = "HTTP/1.1 200 OK\r\n\r\n";
 char *response_not_found = "HTTP/1.1 404 Not Found\r\n\r\n";
+char *response_echo = "HTTP/1.1 200 OK\r\nContent-Type: "
+                      "text/plain\r\nContent-Length: %d\r\n\r\n%s";
+
+void slice(const char *str, char *result, size_t start, size_t end) {
+  strncpy(result, str + start, end - start);
+}
 
 int main() {
   // Disable output buffering
@@ -80,9 +86,31 @@ int main() {
   char *path = strtok(request_buffer, " ");
   path = strtok(NULL, " ");
 
-  char *reply = strcmp(path, "/") == 0 ? response_ok : response_not_found;
+  char *endpoint = strtok(path, "/");
+  char *reply = NULL;
+
+  if (endpoint == NULL) {
+    reply = response_ok;
+  } else if (strcmp(endpoint, "echo") == 0 &&
+             (endpoint = strtok(NULL, " ")) != NULL) {
+    size_t reply_size = strlen(response_echo) + strlen(endpoint) + 1;
+    reply = (char *)malloc(reply_size);
+    if (reply == NULL) {
+      printf("Memory allocation failed: %s\n", strerror(errno));
+      close(client_fd);
+      close(server_fd);
+      return 1;
+    }
+    sprintf(reply, response_echo, strlen(endpoint), endpoint);
+  } else {
+    reply = response_not_found;
+  }
 
   int bytes_sent = send(client_fd, reply, strlen(reply), 0);
+
+  if (reply != response_ok && reply != response_not_found) {
+    free(reply);
+  }
 
   close(server_fd);
 
