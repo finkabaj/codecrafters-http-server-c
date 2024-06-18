@@ -10,12 +10,8 @@
 #define BUF_SIZE 1024
 char *response_ok = "HTTP/1.1 200 OK\r\n\r\n";
 char *response_not_found = "HTTP/1.1 404 Not Found\r\n\r\n";
-char *response_echo = "HTTP/1.1 200 OK\r\nContent-Type: "
-                      "text/plain\r\nContent-Length: %d\r\n\r\n%s";
-
-void slice(const char *str, char *result, size_t start, size_t end) {
-  strncpy(result, str + start, end - start);
-}
+char *response_text_plain = "HTTP/1.1 200 OK\r\nContent-Type: "
+                            "text/plain\r\nContent-Length: %d\r\n\r\n%s";
 
 int main() {
   // Disable output buffering
@@ -83,6 +79,10 @@ int main() {
     printf("Request from client: %s\n", request_buffer);
   }
 
+  int buf_len = strlen(request_buffer);
+  char orig_buffer[buf_len];
+  memcpy(orig_buffer, request_buffer, buf_len);
+
   char *path = strtok(request_buffer, " ");
   path = strtok(NULL, " ");
 
@@ -91,9 +91,32 @@ int main() {
 
   if (endpoint == NULL) {
     reply = response_ok;
+  } else if (strcmp(endpoint, "user-agent") == 0) {
+    char *pre = "User-Agent";
+    char *user_agent = NULL;
+    for (char *head = strtok(orig_buffer, "\r\n"); head != NULL;
+         head = strtok(NULL, "\r\n")) {
+      if (strncmp(pre, head, strlen(pre)) == 0) {
+        user_agent = head + strlen(pre) + 2;
+        break;
+      }
+    }
+    if (user_agent != NULL) {
+      size_t reply_size = strlen(response_text_plain) + strlen(user_agent) + 1;
+      reply = (char *)malloc(reply_size);
+      if (reply == NULL) {
+        printf("Memory allocation failed: %s\n", strerror(errno));
+        close(client_fd);
+        close(server_fd);
+        return 1;
+      }
+      sprintf(reply, response_text_plain, strlen(user_agent), user_agent);
+    } else {
+      reply = response_not_found;
+    }
   } else if (strcmp(endpoint, "echo") == 0 &&
-             (endpoint = strtok(NULL, " ")) != NULL) {
-    size_t reply_size = strlen(response_echo) + strlen(endpoint) + 1;
+             (endpoint = strtok(NULL, "/")) != NULL) {
+    size_t reply_size = strlen(response_text_plain) + strlen(endpoint) + 1;
     reply = (char *)malloc(reply_size);
     if (reply == NULL) {
       printf("Memory allocation failed: %s\n", strerror(errno));
@@ -101,7 +124,7 @@ int main() {
       close(server_fd);
       return 1;
     }
-    sprintf(reply, response_echo, strlen(endpoint), endpoint);
+    sprintf(reply, response_text_plain, strlen(endpoint), endpoint);
   } else {
     reply = response_not_found;
   }
