@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,13 @@ char *response_not_found = "HTTP/1.1 404 Not Found\r\n\r\n";
 char *response_text_plain = "HTTP/1.1 200 OK\r\nContent-Type: "
                             "text/plain\r\nContent-Length: %d\r\n\r\n%s";
 
+struct HandleConnectionArgs {
+  int client_fd;
+  int server_fd;
+};
+
+void *handle_connection(void *arg);
+
 int main() {
   // Disable output buffering
   setbuf(stdout, NULL);
@@ -23,7 +31,6 @@ int main() {
   printf("Logs from your program will appear here!\n");
 
   int server_fd, client_addr_len;
-  struct sockaddr_in client_addr;
 
   server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd == -1) {
@@ -51,32 +58,52 @@ int main() {
     return 1;
   }
 
-  int connection_backlog = 5;
+  int connection_backlog = 10;
   if (listen(server_fd, connection_backlog) != 0) {
     printf("Listen failed: %s \n", strerror(errno));
     return 1;
   }
 
   printf("Waiting for a client to connect...\n");
-  client_addr_len = sizeof(client_addr);
 
-  int client_fd =
-      accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+  while (1) {
+    struct sockaddr_in client_addr;
+    client_addr_len = sizeof(client_addr);
+    int client_fd =
+        accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
 
-  if (client_fd < 0) {
-    printf("Accept failed: %s\n", strerror(errno));
-    return 1;
+    if (client_fd < 0) {
+      printf("Accept failed: %s\n", strerror(errno));
+      exit(EXIT_FAILURE);
+    }
+
+    printf("Client connected\n");
+
+    struct HandleConnectionArgs *args =
+        malloc(sizeof(struct HandleConnectionArgs));
+    args->client_fd = client_fd;
+    args->server_fd = server_fd;
+
+    pthread_t th;
+    pthread_create(&th, NULL, handle_connection, (void *)args);
   }
 
-  printf("Client connected\n");
+  close(server_fd);
+
+  return 0;
+}
+
+void *handle_connection(void *arg) {
+  struct HandleConnectionArgs *args = (struct HandleConnectionArgs *)arg;
+
+  int client_fd = args->client_fd;
+  int server_fd = args->server_fd;
 
   char request_buffer[BUF_SIZE];
 
   if (read(client_fd, request_buffer, BUF_SIZE) < 0) {
     printf("Read failed: %s\n", strerror(errno));
-    return 1;
-  } else {
-    printf("Request from client: %s\n", request_buffer);
+    exit(EXIT_FAILURE);
   }
 
   int buf_len = strlen(request_buffer);
@@ -108,7 +135,7 @@ int main() {
         printf("Memory allocation failed: %s\n", strerror(errno));
         close(client_fd);
         close(server_fd);
-        return 1;
+        exit(EXIT_FAILURE);
       }
       sprintf(reply, response_text_plain, strlen(user_agent), user_agent);
     } else {
@@ -122,7 +149,7 @@ int main() {
       printf("Memory allocation failed: %s\n", strerror(errno));
       close(client_fd);
       close(server_fd);
-      return 1;
+      exit(EXIT_FAILURE);
     }
     sprintf(reply, response_text_plain, strlen(endpoint), endpoint);
   } else {
@@ -135,7 +162,6 @@ int main() {
     free(reply);
   }
 
-  close(server_fd);
-
-  return 0;
+  free(arg);
+  close(client_fd);
 }
