@@ -9,13 +9,15 @@
 #include <unistd.h>
 
 #define BUF_SIZE 1024
+#define ACCEPT_ENCODING "gzip"
+
+enum CONTENT_TYPE {
+  octet_stream,
+  text_plain,
+};
+
 char *response_ok = "HTTP/1.1 200 OK\r\n\r\n";
 char *response_not_found = "HTTP/1.1 404 Not Found\r\n\r\n";
-char *response_text_plain = "HTTP/1.1 200 OK\r\nContent-Type: "
-                            "text/plain\r\nContent-Length: %d\r\n\r\n%s";
-char *response_octec_stream =
-    "HTTP/1.1 200 OK\r\nContent-Type: "
-    "application/octet-stream\r\nContent-Length: %d\r\n\r\n%s";
 char *response_created = "HTTP/1.1 201 Created\r\n\r\n";
 
 struct HandleConnectionArgs {
@@ -24,15 +26,22 @@ struct HandleConnectionArgs {
   char *dir;
 };
 
-char *find_substring_between(const char *str, const char *start_str,
-                             const char *end_str);
+int find_substring_between(char **str, const char *orig_str,
+                           const char *start_str, const char *end_str);
 void *handle_connection(void *arg);
-char *handle_echo(char *endpoint, int client_fd, int server_fd);
+char *handle_echo(char *endpoint, char orig_buffer[BUF_SIZE], int client_fd,
+                  int server_fd);
 char *handle_user_agent(char orig_buffer[BUF_SIZE], int client_fd,
                         int server_fd);
-char *handle_get_files(char *filename, char *dir, int client_fd, int server_fd);
+char *handle_get_files(char *filename, char *dir, char orig_buffer[BUF_SIZE],
+                       int client_fd, int server_fd);
 char *handle_post_files(char *filename, char *dir, char orig_buffer[BUF_SIZE],
                         int client_fd, int server_fd);
+int get_encoding(char **str, char orig_buffer[BUF_SIZE]);
+char *get_response_with_body(enum CONTENT_TYPE type, int content_length,
+                             char *body, char *encoding);
+
+// TODO: change sprintf to strncat
 
 int main(int argc, char **argv) {
   // Disable output buffering
@@ -106,8 +115,6 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     }
 
-    printf("Client connected\n");
-
     struct HandleConnectionArgs *args =
         malloc(sizeof(struct HandleConnectionArgs));
     args->client_fd = client_fd;
@@ -132,91 +139,99 @@ void *handle_connection(void *arg) {
 
   char request_buffer[BUF_SIZE];
 
-  if (read(client_fd, request_buffer, BUF_SIZE) < 0) {
+  ssize_t bytes_read = read(client_fd, request_buffer, BUF_SIZE - 1);
+  if (bytes_read < 0) {
     printf("Read failed: %s\n", strerror(errno));
-    exit(EXIT_FAILURE);
+    goto cleanup;
+  }
+  request_buffer[bytes_read] = '\0';
+
+  char *reply = NULL;
+  char method[16] = {0};
+  char path[BUF_SIZE] = {0};
+  char *endpoint = NULL;
+
+  if (sscanf(request_buffer, "%15s %1023s", method, path) != 2) {
+    printf("Failed parse request line\n");
+    reply = response_not_found;
+    goto end;
   }
 
-  int buf_len = strlen(request_buffer);
-  char orig_buffer[BUF_SIZE];
-  memcpy(orig_buffer, request_buffer, buf_len);
+  endpoint = path + 1;
+  char *slash = strchr(endpoint, '/');
+  if (slash) {
+    slash++;
+  }
 
-  char *path = strtok(request_buffer, " ");
-  char *method = path;
-  path = strtok(NULL, " ");
-
-  char *endpoint = strtok(path, "/");
-  char *reply = NULL;
-
-  if (endpoint == NULL && strcmp(method, "GET") == 0) {
+  if (strlen(endpoint) == 0 && strcmp(method, "GET") == 0) {
     reply = response_ok;
-  } else if (endpoint != NULL && strcmp(endpoint, "user-agent") == 0 &&
+  } else if (strncmp(endpoint, "user-agent", 10) == 0 &&
              strcmp(method, "GET") == 0) {
-    reply = handle_user_agent(orig_buffer, client_fd, server_fd);
-  } else if (endpoint != NULL && strcmp(endpoint, "echo") == 0 &&
-             strcmp(method, "GET") == 0 &&
-             (endpoint = strtok(NULL, "/")) != NULL) {
-    reply = handle_echo(endpoint, client_fd, server_fd);
-  } else if (endpoint != NULL && strcmp(endpoint, "files") == 0 &&
-             strcmp(method, "GET") == 0 &&
-             (endpoint = strtok(NULL, "/")) != NULL) {
-    reply = handle_get_files(endpoint, dir, client_fd, server_fd);
-  } else if (endpoint != NULL && strcmp(endpoint, "files") == 0 &&
-             strcmp(method, "POST") == 0 &&
-             (endpoint = strtok(NULL, "/")) != NULL) {
-    reply = handle_post_files(endpoint, dir, orig_buffer, client_fd, server_fd);
+    reply = handle_user_agent(request_buffer, client_fd, server_fd);
+  } else if (strncmp(endpoint, "echo", 4) == 0 && strcmp(method, "GET") == 0 &&
+             slash) {
+    reply = handle_echo(slash, request_buffer, client_fd, server_fd);
+  } else if (strncmp(endpoint, "files", 5) == 0 && strcmp(method, "GET") == 0 &&
+             slash) {
+    reply = handle_get_files(slash, dir, request_buffer, client_fd, server_fd);
+  } else if (strncmp(endpoint, "files", 5) == 0 &&
+             strcmp(method, "POST") == 0 && slash) {
+    reply = handle_post_files(slash, dir, request_buffer, client_fd, server_fd);
   } else {
     reply = response_not_found;
   }
 
-  int bytes_sent = send(client_fd, reply, strlen(reply), 0);
+end:
+  send(client_fd, reply, strlen(reply), 0);
 
   if (reply != response_ok && reply != response_not_found &&
       reply != response_created) {
     free(reply);
   }
 
+cleanup:
   free(arg);
   close(client_fd);
-  return 0;
+  return NULL;
 }
 
-char *handle_echo(char *endpoint, int client_fd, int server_fd) {
+char *handle_echo(char *slash, char orig_buffer[BUF_SIZE], int client_fd,
+                  int server_fd) {
   char *reply = NULL;
-  size_t reply_size = strlen(response_text_plain) + strlen(endpoint) + 1;
-  reply = (char *)malloc(reply_size);
+  char *accept_encoding = NULL;
+  get_encoding(&accept_encoding, orig_buffer);
+  reply =
+      get_response_with_body(text_plain, strlen(slash), slash, accept_encoding);
   if (reply == NULL) {
     printf("Memory allocation failed: %s\n", strerror(errno));
     close(client_fd);
     close(server_fd);
     exit(EXIT_FAILURE);
   }
-  sprintf(reply, response_text_plain, strlen(endpoint), endpoint);
 
   return reply;
 }
 
-char *handle_user_agent(char orig_buffer[], int client_fd, int server_fd) {
+char *handle_user_agent(char orig_buffer[BUF_SIZE], int client_fd,
+                        int server_fd) {
   char *reply = NULL;
-  char *pre = "User-Agent";
+  char *pre = "User-Agent: ";
   char *user_agent = NULL;
-  for (char *head = strtok(orig_buffer, "\r\n"); head != NULL;
-       head = strtok(NULL, "\r\n")) {
-    if (strncmp(pre, head, strlen(pre)) == 0) {
-      user_agent = head + strlen(pre) + 2;
-      break;
-    }
-  }
-  if (user_agent != NULL) {
-    size_t reply_size = strlen(response_text_plain) + strlen(user_agent) + 1;
-    reply = (char *)malloc(reply_size);
+  char *accept_encoding = NULL;
+  get_encoding(&accept_encoding, orig_buffer);
+  int user_agent_len =
+      find_substring_between(&user_agent, orig_buffer, pre, "\r\n");
+  if (user_agent_len > 0) {
+    reply = get_response_with_body(text_plain, user_agent_len, user_agent,
+                                   accept_encoding);
     if (reply == NULL) {
       printf("Memory allocation failed: %s\n", strerror(errno));
+      free(user_agent);
       close(client_fd);
       close(server_fd);
       exit(EXIT_FAILURE);
     }
-    sprintf(reply, response_text_plain, strlen(user_agent), user_agent);
+    free(user_agent);
   } else {
     reply = response_not_found;
   }
@@ -224,12 +239,10 @@ char *handle_user_agent(char orig_buffer[], int client_fd, int server_fd) {
   return reply;
 }
 
-char *handle_get_files(char *filename, char *dir, int client_fd,
-                       int server_fd) {
+char *handle_get_files(char *filename, char *dir, char orig_buffer[BUF_SIZE],
+                       int client_fd, int server_fd) {
   char *reply = NULL;
   size_t len;
-
-  // TODO: validate path
 
   char path[strlen(filename) + strlen(dir) + 2];
   sprintf(path, "%s/%s", dir, filename);
@@ -253,15 +266,16 @@ char *handle_get_files(char *filename, char *dir, int client_fd,
   fread(f_buff, 1, len, fp);
 
   fclose(fp);
+  char *encoding = NULL;
+  get_encoding(&encoding, orig_buffer);
 
-  size_t reply_size = strlen(response_octec_stream) + len + 1;
+  reply = get_response_with_body(octet_stream, len, f_buff, encoding);
 
-  if ((reply = (char *)malloc(reply_size)) == NULL) {
+  if (reply == NULL) {
     printf("Memory allocation failed: %s\n", strerror(errno));
     free(f_buff);
     return response_not_found;
   }
-  sprintf(reply, response_octec_stream, len, f_buff);
   free(f_buff);
 
   return reply;
@@ -270,8 +284,8 @@ char *handle_get_files(char *filename, char *dir, int client_fd,
 char *handle_post_files(char *filename, char *dir, char orig_buffer[BUF_SIZE],
                         int client_fd, int server_fd) {
   char *content_length_str = NULL;
-  if ((content_length_str = find_substring_between(
-           orig_buffer, "Content-Length: ", "\r\n")) == NULL) {
+  if (find_substring_between(&content_length_str, orig_buffer,
+                             "Content-Length: ", "\r\n") == -1) {
     printf("handle_post_files: Content-Length header not found\n");
     return response_not_found;
   }
@@ -324,29 +338,84 @@ char *handle_post_files(char *filename, char *dir, char orig_buffer[BUF_SIZE],
   return response_created;
 }
 
-char *find_substring_between(const char *str, const char *start_str,
-                             const char *end_str) {
-  char *start = strstr(str, start_str);
+int find_substring_between(char **str, const char *orig_str,
+                           const char *start_str, const char *end_str) {
+  char *start = strstr(orig_str, start_str);
   if (start == NULL) {
-    return NULL;
+    return -1;
   }
 
   start += strlen(start_str);
 
   char *end = strstr(start, end_str);
   if (end == NULL) {
-    return NULL;
+    return -1;
   }
 
   size_t len = end - start;
 
-  char *result = (char *)malloc(len + 1);
-  if (result == NULL) {
+  *str = (char *)malloc(len + 1);
+  if (*str == NULL) {
+    return -1;
+  }
+
+  strncpy(*str, start, len);
+  (*str)[len] = '\0';
+
+  return len;
+}
+
+int get_encoding(char **str, char orig_buffer[BUF_SIZE]) {
+  int len =
+      find_substring_between(str, orig_buffer, "Accept-Encoding: ", "\r\n");
+
+  if (len == -1) {
+    return -1;
+  }
+
+  *str = strtok(*str, ", ");
+
+  while (*str != NULL) {
+    if (strcmp(*str, ACCEPT_ENCODING) == 0) {
+      return strlen(*str);
+    }
+    *str = strtok(NULL, ", ");
+  }
+
+  *str = NULL;
+
+  return -1;
+}
+
+char *get_response_with_body(enum CONTENT_TYPE type, int content_length,
+                             char *body, char *encoding) {
+  char *response_template = "HTTP/1.1 200 OK\r\n"
+                            "%s"
+                            "%s"
+                            "Content-Length: %d\r\n"
+                            "\r\n"
+                            "%s";
+  char encoding_header[64] = "";
+  char *content_type_header = type == octet_stream
+                                  ? "Content-Type: application/octet-stream\r\n"
+                                  : "Content-Type: text/plain\r\n";
+
+  if (encoding) {
+    snprintf(encoding_header, sizeof(encoding_header),
+             "Content-Encoding: %s\r\n", encoding);
+  }
+
+  size_t response_size = strlen(response_template) +
+                         strlen(content_type_header) + strlen(encoding_header) +
+                         content_length;
+  char *reply = malloc(response_size);
+  if (!reply) {
+    printf("get_response_text_plain: allocation failed\n");
     return NULL;
   }
 
-  strncpy(result, start, len);
-  result[len] = '\0';
+  snprintf(reply, response_size, response_template, content_type_header,
+           encoding_header, content_length, body);
 
-  return result;
+  return reply;
 }
