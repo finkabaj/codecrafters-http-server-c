@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #define BUF_SIZE 1024
 #define ACCEPT_ENCODING "gzip"
@@ -16,9 +17,9 @@ enum CONTENT_TYPE {
   text_plain,
 };
 
-char *response_ok = "HTTP/1.1 200 OK\r\n\r\n";
-char *response_not_found = "HTTP/1.1 404 Not Found\r\n\r\n";
-char *response_created = "HTTP/1.1 201 Created\r\n\r\n";
+char response_ok[] = "HTTP/1.1 200 OK\r\n\r\n";
+char response_not_found[] = "HTTP/1.1 404 Not Found\r\n\r\n";
+char response_created[] = "HTTP/1.1 201 Created\r\n\r\n";
 
 struct HandleConnectionArgs {
   int client_fd;
@@ -40,8 +41,7 @@ char *handle_post_files(char *filename, char *dir, char orig_buffer[BUF_SIZE],
 int get_encoding(char **str, char orig_buffer[BUF_SIZE]);
 char *get_response_with_body(enum CONTENT_TYPE type, int content_length,
                              char *body, char *encoding);
-
-// TODO: change sprintf to strncat
+int gzip(const char *str, int str_len, char **dst_str);
 
 int main(int argc, char **argv) {
   // Disable output buffering
@@ -182,11 +182,17 @@ void *handle_connection(void *arg) {
   }
 
 end:
-  send(client_fd, reply, strlen(reply), 0);
-
   if (reply != response_ok && reply != response_not_found &&
       reply != response_created) {
+    int headers_len = strstr(reply, "\r\n\r\n") - reply + 4;
+    int total_len = headers_len;
+    sscanf(strstr(reply, "Content-Length: "), "Content-Length: %d", &total_len);
+    total_len += headers_len;
+
+    send(client_fd, reply, total_len, 0);
     free(reply);
+  } else {
+    send(client_fd, reply, strlen(reply), 0);
   }
 
 cleanup:
@@ -389,33 +395,92 @@ int get_encoding(char **str, char orig_buffer[BUF_SIZE]) {
 
 char *get_response_with_body(enum CONTENT_TYPE type, int content_length,
                              char *body, char *encoding) {
-  char *response_template = "HTTP/1.1 200 OK\r\n"
-                            "%s"
-                            "%s"
-                            "Content-Length: %d\r\n"
-                            "\r\n"
-                            "%s";
-  char encoding_header[64] = "";
   char *content_type_header = type == octet_stream
                                   ? "Content-Type: application/octet-stream\r\n"
                                   : "Content-Type: text/plain\r\n";
-
+  char encoding_header[64] = "";
+  int need_to_free = 0;
   if (encoding) {
     snprintf(encoding_header, sizeof(encoding_header),
              "Content-Encoding: %s\r\n", encoding);
+    char *compressed;
+    int compressed_len = gzip(body, content_length, &compressed);
+
+    if (compressed_len < 0) {
+      printf("compression failed\n");
+      return NULL;
+    }
+
+    body = compressed;
+    content_length = compressed_len;
+    need_to_free = 1;
   }
 
-  size_t response_size = strlen(response_template) +
-                         strlen(content_type_header) + strlen(encoding_header) +
-                         content_length;
-  char *reply = malloc(response_size);
-  if (!reply) {
-    printf("get_response_text_plain: allocation failed\n");
+  char *headers = malloc(256);
+  if (!headers) {
+    printf("Header allocation failed\n");
+    if (need_to_free) {
+      free(body);
+    }
     return NULL;
   }
 
-  snprintf(reply, response_size, response_template, content_type_header,
-           encoding_header, content_length, body);
+  snprintf(headers, 256,
+           "HTTP/1.1 200 OK\r\n"
+           "%s"
+           "%s"
+           "Content-Length: %d\r\n"
+           "\r\n",
+           content_type_header, encoding_header, content_length);
 
-  return reply;
+  int headers_len = strlen(headers);
+  char *full_response = malloc(headers_len + content_length);
+  if (!full_response) {
+    printf("Full response allocation failed\n");
+    if (need_to_free) {
+      free(body);
+    }
+    free(headers);
+    return NULL;
+  }
+
+  memcpy(full_response, headers, headers_len);
+  memcpy(full_response + headers_len, body, content_length);
+
+  if (need_to_free) {
+    free(body);
+  }
+  free(headers);
+
+  return full_response;
+}
+
+int gzip(const char *str, int str_len, char **dst_str) {
+  z_stream strm;
+  int comp_size = 128 + str_len;
+  char *comp = (char *)malloc(comp_size);
+  strm.zalloc = Z_NULL;
+  strm.zfree = Z_NULL;
+  strm.opaque = Z_NULL;
+
+  if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8,
+                   Z_DEFAULT_STRATEGY) != Z_OK) {
+    return -1;
+  }
+
+  strm.avail_in = str_len;
+  strm.next_in = (Bytef *)str;
+  strm.avail_out = comp_size;
+  strm.next_out = (Bytef *)comp;
+
+  int ret = deflate(&strm, Z_FINISH);
+  deflateEnd(&strm);
+
+  if (ret != Z_STREAM_END) {
+    return -1;
+  }
+
+  *dst_str = comp;
+
+  return strm.total_out;
 }
